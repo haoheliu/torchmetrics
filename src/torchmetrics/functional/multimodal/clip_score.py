@@ -44,6 +44,8 @@ else:
 def _clip_score_update(
     images: Union[Tensor, List[Tensor]],
     text: Union[str, List[str]],
+    img_features_prev: None,
+    txt_features_prev: None,
     model: _CLIPModel,
     processor: _CLIPProcessor,
 ) -> Tuple[Tensor, int]:
@@ -64,30 +66,37 @@ def _clip_score_update(
             f"Expected the number of images and text examples to be the same but got {len(images)} and {len(text)}"
         )
     device = images[0].device
-    processed_input = processor(text=text, images=[i.cpu() for i in images], return_tensors="pt", padding=True)
+    
+    if img_features_prev is None or txt_features_prev is None:
+        processed_input = processor(text=text, images=[i.cpu() for i in images], return_tensors="pt", padding=True)
 
-    img_features = model.get_image_features(processed_input["pixel_values"].to(device))
-    img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
+        img_features = model.get_image_features(processed_input["pixel_values"].to(device))
+        img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
 
-    max_position_embeddings = model.config.text_config.max_position_embeddings
-    if processed_input["attention_mask"].shape[-1] > max_position_embeddings:
-        rank_zero_warn(
-            f"Encountered caption longer than {max_position_embeddings=}. Will truncate captions to this length."
-            "If longer captions are needed, initialize argument `model_name_or_path` with a model that supports"
-            "longer sequences",
-            UserWarning,
-        )
-        processed_input["attention_mask"] = processed_input["attention_mask"][..., :max_position_embeddings]
-        processed_input["input_ids"] = processed_input["input_ids"][..., :max_position_embeddings]
+        if txt_features_prev is None:
+            max_position_embeddings = model.config.text_config.max_position_embeddings
+            if processed_input["attention_mask"].shape[-1] > max_position_embeddings:
+                rank_zero_warn(
+                    f"Encountered caption longer than {max_position_embeddings=}. Will truncate captions to this length."
+                    "If longer captions are needed, initialize argument `model_name_or_path` with a model that supports"
+                    "longer sequences",
+                    UserWarning,
+                )
+                processed_input["attention_mask"] = processed_input["attention_mask"][..., :max_position_embeddings]
+                processed_input["input_ids"] = processed_input["input_ids"][..., :max_position_embeddings]
 
-    txt_features = model.get_text_features(
-        processed_input["input_ids"].to(device), processed_input["attention_mask"].to(device)
-    )
-    txt_features = txt_features / txt_features.norm(p=2, dim=-1, keepdim=True)
-
+            txt_features = model.get_text_features(
+                processed_input["input_ids"].to(device), processed_input["attention_mask"].to(device)
+            )
+            txt_features = txt_features / txt_features.norm(p=2, dim=-1, keepdim=True)
+        else:
+            txt_features = txt_features_prev
+    else:
+        img_features = img_features_prev
+        txt_features = txt_features_prev
     # cosine similarity between feature vectors
     score = 100 * (img_features * txt_features).sum(axis=-1)
-    return score, len(text)
+    return score, len(text), img_features, txt_features
 
 
 def _get_clip_model_and_processor(

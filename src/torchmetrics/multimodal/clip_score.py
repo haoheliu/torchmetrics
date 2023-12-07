@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Any, List, Optional, Sequence, Union
-
+import os
 import torch
 from torch import Tensor
 from typing_extensions import Literal
@@ -39,6 +39,16 @@ if _SKIP_SLOW_DOCTEST and _TRANSFORMERS_GREATER_EQUAL_4_10:
 else:
     __doctest_skip__ = ["CLIPScore", "CLIPScore.plot"]
 
+import pickle
+
+def save_pickle(obj, fname):
+    with open(fname, "wb") as f:
+        pickle.dump(obj, f)
+
+def load_pickle(fname):
+    with open(fname, "rb") as f:
+        res = pickle.load(f)
+    return res
 
 class CLIPScore(Metric):
     r"""Calculates `CLIP Score`_ which is a text-to-image similarity metric.
@@ -114,8 +124,9 @@ class CLIPScore(Metric):
         self.model, self.processor = _get_clip_model_and_processor(model_name_or_path)
         self.add_state("score", torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("n_samples", torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
+        self.txt_feature_cache = {}
 
-    def update(self, images: Union[Tensor, List[Tensor]], text: Union[str, List[str]]) -> None:
+    def update(self, images: Union[Tensor, List[Tensor]], text: Union[str, List[str]], image_src_path: str) -> None:
         """Update CLIP score on a batch of images and text.
 
         Args:
@@ -129,7 +140,24 @@ class CLIPScore(Metric):
                 If the number of images and captions do not match
 
         """
-        score, n_samples = _clip_score_update(images, text, self.model, self.processor)
+        image_feature_path = image_src_path+"_clip.pkl"
+        if os.path.exists(image_feature_path):
+            img_features_prev = load_pickle(image_feature_path)
+        else:
+            img_features_prev = None
+
+        if text in self.txt_feature_cache.keys():
+            txt_features_prev = self.txt_feature_cache[text]
+        else:
+            txt_features_prev = None
+
+        score, n_samples, img_features, txt_features = _clip_score_update(images, text, img_features_prev ,txt_features_prev, self.model, self.processor)
+
+        if txt_features_prev is None:
+            self.txt_feature_cache[text] = txt_features
+        if img_features_prev is None:
+            save_pickle(img_features, image_feature_path)
+
         self.score += score.sum(0)
         self.n_samples += n_samples
 
