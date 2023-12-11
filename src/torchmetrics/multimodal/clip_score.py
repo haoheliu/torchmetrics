@@ -13,12 +13,17 @@
 # limitations under the License.
 from typing import Any, List, Optional, Sequence, Union
 import os
+import random
+import cv2
+import traceback
+from PIL import Image
 import torch
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from torch import Tensor
 from typing_extensions import Literal
-
+from tqdm import tqdm
 from torchmetrics import Metric
-from torchmetrics.functional.multimodal.clip_score import _clip_score_update, _get_clip_model_and_processor
+from torchmetrics.functional.multimodal.clip_score import _clip_score_update, _get_clip_model_and_processor, _get_image_feature, _get_text_feature
 from torchmetrics.utilities.checks import _SKIP_SLOW_DOCTEST, _try_proceed_with_timeout
 from torchmetrics.utilities.imports import _MATPLOTLIB_AVAILABLE, _TRANSFORMERS_GREATER_EQUAL_4_10
 from torchmetrics.utilities.plot import _AX_TYPE, _PLOT_OUT_TYPE
@@ -125,6 +130,85 @@ class CLIPScore(Metric):
         self.add_state("score", torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("n_samples", torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
         self.txt_feature_cache = {}
+        self.image_feature_cache = {}
+
+        self.dataset_visual_feature_cache = {}
+
+    def preprocess_image(self, image):
+        preprocess = Compose(
+            [
+                Resize(256),
+                CenterCrop(224),
+                ToTensor(),
+            ]
+        )
+        image = preprocess(image)
+        image = (image * 255).to(torch.uint8)
+        return image
+    
+    def extract_random_frame(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        random_frame = random.randint(0, frame_count - 1)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, random_frame)
+        success, frame = cap.read()
+        cap.release()
+        if success:
+            return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        else:
+            return None
+        
+    def build_dataset_cache(self, video_or_image_candidates_path_list):
+        dataset_size = len(video_or_image_candidates_path_list)
+        # If the dataset cache is already built, return
+        if dataset_size in self.dataset_visual_feature_cache.keys():
+            return
+        self.dataset_visual_feature_cache[dataset_size] = {}
+        self.dataset_visual_feature_cache[dataset_size]["feature"] = []
+        self.dataset_visual_feature_cache[dataset_size]["path"] = []
+        for candidate in tqdm(video_or_image_candidates_path_list):
+            if candidate.endswith(".mp4"):
+                frame_save_path = candidate+"_rand_frame.jpg"
+                if os.path.exists(frame_save_path):
+                    frame = Image.open(frame_save_path).convert("RGB")
+                else:
+                    try:
+                        frame = self.extract_random_frame(candidate)
+                    except Exception as e:
+                        traceback.print_exc()
+                        print("Error when extracting random frame", e, candidate)
+                        continue
+                    frame.save(frame_save_path)
+            else:
+                frame = Image.open(candidate).convert("RGB")
+            cached_path = candidate+"_clip.pkl"
+            if os.path.exists(cached_path):
+                visual_feature = load_pickle(cached_path)
+            else:
+                visual_feature = _get_image_feature(self.preprocess_image(frame), self.model, self.processor)
+                save_pickle(visual_feature, cached_path)
+            self.dataset_visual_feature_cache[dataset_size]["feature"].append(visual_feature)
+            self.dataset_visual_feature_cache[dataset_size]["path"].append(candidate)
+        
+        self.dataset_visual_feature_cache[dataset_size]["feature"] = torch.cat(self.dataset_visual_feature_cache[dataset_size]["feature"], dim=0)
+
+    def get_device(self):
+        return next(self.model.parameters()).device
+    
+    def query_resource_by_text(self, text, video_or_image_candidates_path_list, top_k=10):
+        self.build_dataset_cache(video_or_image_candidates_path_list)
+        text_feature = _get_text_feature(text, self.model, self.processor)
+        # Calculate the similarity between the text and each image
+        candidate_feature = self.dataset_visual_feature_cache[len(video_or_image_candidates_path_list)]["feature"]
+        candidate_path = self.dataset_visual_feature_cache[len(video_or_image_candidates_path_list)]["path"]
+        score = 100*(candidate_feature * text_feature).sum(axis=-1)
+        ranks = torch.argsort(score, descending=True)
+        result_filepath = []
+        for i, index in enumerate(ranks):
+            if i > top_k: break
+            else:
+                result_filepath.append(candidate_path[index])
+        return result_filepath
 
     def update(self, images: Union[Tensor, List[Tensor]], text: Union[str, List[str]], image_src_path: str) -> None:
         """Update CLIP score on a batch of images and text.
@@ -141,10 +225,13 @@ class CLIPScore(Metric):
 
         """
         image_feature_path = image_src_path+"_clip.pkl"
-        if os.path.exists(image_feature_path):
-            img_features_prev = load_pickle(image_feature_path)
+        if image_feature_path in self.image_feature_cache.keys():
+            img_features_prev = self.image_feature_cache[image_feature_path]
         else:
-            img_features_prev = None
+            if os.path.exists(image_feature_path):
+                img_features_prev = load_pickle(image_feature_path)
+            else:
+                img_features_prev = None
 
         if text in self.txt_feature_cache.keys():
             txt_features_prev = self.txt_feature_cache[text]
