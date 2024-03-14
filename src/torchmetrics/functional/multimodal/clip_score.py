@@ -29,21 +29,69 @@ if _SKIP_SLOW_DOCTEST and _TRANSFORMERS_GREATER_EQUAL_4_10:
     from transformers import CLIPModel as _CLIPModel
     from transformers import CLIPProcessor as _CLIPProcessor
 
-    def _download_clip_for_clip_score() -> None:
-        _CLIPModel.from_pretrained("openai/clip-vit-large-patch14", resume_download=True)
-        _CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", resume_download=True)
+    def _download_clip() -> None:
+        _CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+        _CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    if not _try_proceed_with_timeout(_download_clip_for_clip_score):
+    if not _try_proceed_with_timeout(_download_clip):
         __doctest_skip__ = ["clip_score"]
 else:
     __doctest_skip__ = ["clip_score"]
     _CLIPModel = None
     _CLIPProcessor = None
 
+def _get_image_feature(
+    images: Union[Tensor, List[Tensor]],
+    model: _CLIPModel,
+    processor: _CLIPProcessor,
+    device = torch.device("cuda"),
+) -> Tuple[Tensor, int]:
+    if not isinstance(images, list):
+        if images.ndim == 3:
+            images = [images]
+    else:  # unwrap into list
+        images = list(images)
+
+    if not all(i.ndim == 3 for i in images):
+        raise ValueError("Expected all images to be 3d but found image that has either more or less")
+    
+    processed_input = processor(images=[i.cpu() for i in images], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        img_features = model.get_image_features(processed_input["pixel_values"].to(device))
+    img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
+    return img_features
+
+def _get_text_feature(
+    text: Union[str, List[str]],
+    model: _CLIPModel,
+    processor: _CLIPProcessor,
+    device = torch.device("cuda"),
+) -> Tuple[Tensor, int]:
+    if not isinstance(text, list):
+        text = [text]
+    processed_input = processor(text=text, return_tensors="pt", padding=True)
+    max_position_embeddings = model.config.text_config.max_position_embeddings
+    if processed_input["attention_mask"].shape[-1] > max_position_embeddings:
+        rank_zero_warn(
+            f"Encountered caption longer than {max_position_embeddings=}. Will truncate captions to this length."
+            "If longer captions are needed, initialize argument `model_name_or_path` with a model that supports"
+            "longer sequences",
+            UserWarning,
+        )
+        processed_input["attention_mask"] = processed_input["attention_mask"][..., :max_position_embeddings]
+        processed_input["input_ids"] = processed_input["input_ids"][..., :max_position_embeddings]
+
+    txt_features = model.get_text_features(
+        processed_input["input_ids"].to(device), processed_input["attention_mask"].to(device)
+    )
+    txt_features = txt_features / txt_features.norm(p=2, dim=-1, keepdim=True)
+    return txt_features
 
 def _clip_score_update(
     images: Union[Tensor, List[Tensor]],
     text: Union[str, List[str]],
+    img_features_prev: None,
+    txt_features_prev: None,
     model: _CLIPModel,
     processor: _CLIPProcessor,
 ) -> Tuple[Tensor, int]:
@@ -64,30 +112,37 @@ def _clip_score_update(
             f"Expected the number of images and text examples to be the same but got {len(images)} and {len(text)}"
         )
     device = images[0].device
-    processed_input = processor(text=text, images=[i.cpu() for i in images], return_tensors="pt", padding=True)
+    
+    if img_features_prev is None or txt_features_prev is None:
+        processed_input = processor(text=text, images=[i.cpu() for i in images], return_tensors="pt", padding=True)
 
-    img_features = model.get_image_features(processed_input["pixel_values"].to(device))
-    img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
+        img_features = model.get_image_features(processed_input["pixel_values"].to(device))
+        img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
 
-    max_position_embeddings = model.config.text_config.max_position_embeddings
-    if processed_input["attention_mask"].shape[-1] > max_position_embeddings:
-        rank_zero_warn(
-            f"Encountered caption longer than {max_position_embeddings=}. Will truncate captions to this length."
-            "If longer captions are needed, initialize argument `model_name_or_path` with a model that supports"
-            "longer sequences",
-            UserWarning,
-        )
-        processed_input["attention_mask"] = processed_input["attention_mask"][..., :max_position_embeddings]
-        processed_input["input_ids"] = processed_input["input_ids"][..., :max_position_embeddings]
+        if txt_features_prev is None:
+            max_position_embeddings = model.config.text_config.max_position_embeddings
+            if processed_input["attention_mask"].shape[-1] > max_position_embeddings:
+                rank_zero_warn(
+                    f"Encountered caption longer than {max_position_embeddings=}. Will truncate captions to this length."
+                    "If longer captions are needed, initialize argument `model_name_or_path` with a model that supports"
+                    "longer sequences",
+                    UserWarning,
+                )
+                processed_input["attention_mask"] = processed_input["attention_mask"][..., :max_position_embeddings]
+                processed_input["input_ids"] = processed_input["input_ids"][..., :max_position_embeddings]
 
-    txt_features = model.get_text_features(
-        processed_input["input_ids"].to(device), processed_input["attention_mask"].to(device)
-    )
-    txt_features = txt_features / txt_features.norm(p=2, dim=-1, keepdim=True)
-
+            txt_features = model.get_text_features(
+                processed_input["input_ids"].to(device), processed_input["attention_mask"].to(device)
+            )
+            txt_features = txt_features / txt_features.norm(p=2, dim=-1, keepdim=True)
+        else:
+            txt_features = txt_features_prev
+    else:
+        img_features = img_features_prev
+        txt_features = txt_features_prev
     # cosine similarity between feature vectors
     score = 100 * (img_features * txt_features).sum(axis=-1)
-    return score, len(text)
+    return score, len(text), img_features, txt_features
 
 
 def _get_clip_model_and_processor(
